@@ -295,6 +295,124 @@ async function dismissSavedTab(id) {
 
 
 /* ----------------------------------------------------------------
+   QUICK ACCESS — user-managed shortcuts stored locally
+   ---------------------------------------------------------------- */
+
+function normalizeQuickLinkUrl(value) {
+  const trimmed = value.trim();
+  const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  const parsed = new URL(candidate);
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL');
+  return parsed.href;
+}
+
+async function getCustomQuickLinks() {
+  const { customQuickLinks = [] } = await chrome.storage.local.get('customQuickLinks');
+  return Array.isArray(customQuickLinks) ? customQuickLinks : [];
+}
+
+async function addCustomQuickLink(url) {
+  const customQuickLinks = await getCustomQuickLinks();
+  const normalizedUrl = normalizeQuickLinkUrl(url);
+  const domain = new URL(normalizedUrl).hostname.replace(/^www\./, '');
+  const derivedName = friendlyDomain(domain) || domain;
+  const existing = customQuickLinks.find(link => link.url === normalizedUrl);
+
+  if (existing) {
+    existing.name ||= derivedName;
+  } else {
+    customQuickLinks.push({
+      id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      name: derivedName,
+      url: normalizedUrl,
+    });
+  }
+
+  await chrome.storage.local.set({ customQuickLinks });
+}
+
+async function removeCustomQuickLink(id) {
+  const customQuickLinks = await getCustomQuickLinks();
+  await chrome.storage.local.set({
+    customQuickLinks: customQuickLinks.filter(link => link.id !== id),
+  });
+}
+
+async function renderQuickLinks() {
+  const container = document.getElementById('quickLinks');
+  if (!container) return;
+
+  try {
+    const links = await getCustomQuickLinks();
+
+    if (links.length === 0) {
+      container.replaceChildren();
+      const formOpen = !document.getElementById('quickLinkForm')?.hidden;
+      syncQuickAccessVisibility(false, formOpen);
+      return;
+    }
+
+    container.innerHTML = links.map((link, index) => {
+      let domain = '';
+      try { domain = new URL(link.url).hostname.replace(/^www\./, ''); } catch {}
+      const name = link.name || friendlyDomain(domain);
+      const safeName = escapeHtml(name);
+      const safeUrl = escapeHtml(link.url);
+      const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+      const fallback = escapeHtml((name || domain || '?').charAt(0).toUpperCase());
+      const delay = Math.min(180 + index * 45, 540);
+      const removeButton = `<button class="quick-link-remove" type="button" data-action="remove-quick-link" data-quick-link-id="${escapeHtml(link.id)}" aria-label="Remove ${safeName}">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+        </button>`;
+
+      return `
+        <div class="quick-link-shell" style="--quick-link-delay:${delay}ms">
+          <button class="quick-link" type="button" data-action="open-quick-link" data-quick-link-url="${safeUrl}" title="Open ${safeName}">
+            <span class="quick-link-icon">
+              <img src="${escapeHtml(faviconUrl)}" alt="" data-hide-on-error>
+              <span class="quick-link-fallback" aria-hidden="true">${fallback}</span>
+            </span>
+            <span class="quick-link-copy">
+              <span class="quick-link-name">${safeName}</span>
+            </span>
+          </button>
+          ${removeButton}
+        </div>`;
+    }).join('');
+    syncQuickAccessVisibility(true);
+  } catch (err) {
+    console.warn('[tab-out] Could not load quick access shortcuts:', err);
+    container.textContent = '';
+  }
+}
+
+function syncQuickAccessVisibility(hasLinks, formOpen = false) {
+  const section = document.getElementById('quickLinksSection');
+  const emptyCta = document.getElementById('headerQuickLinkCta');
+  if (!section || !emptyCta) return;
+
+  section.hidden = !hasLinks && !formOpen;
+  emptyCta.hidden = hasLinks || formOpen;
+}
+
+function setQuickLinkFormOpen(isOpen) {
+  const form = document.getElementById('quickLinkForm');
+  const triggers = document.querySelectorAll('[data-action="toggle-quick-link-form"]');
+  if (!form) return;
+
+  if (isOpen) {
+    form.removeAttribute('hidden');
+  } else {
+    form.setAttribute('hidden', '');
+  }
+  triggers.forEach(trigger => trigger.setAttribute('aria-expanded', String(isOpen)));
+  const hasLinks = Boolean(document.querySelector('#quickLinks .quick-link-shell'));
+  syncQuickAccessVisibility(hasLinks, isOpen);
+  if (isOpen) document.getElementById('quickLinkUrl')?.focus();
+}
+
+
+/* ----------------------------------------------------------------
    UI HELPERS
    ---------------------------------------------------------------- */
 
@@ -1058,6 +1176,9 @@ async function renderStaticDashboard() {
   if (greetingEl) greetingEl.textContent = getGreeting();
   if (dateEl)     dateEl.textContent     = getDateDisplay();
 
+  // --- Favorites ---
+  await renderQuickLinks();
+
   // --- Fetch tabs ---
   await fetchOpenTabs();
   const realTabs = getRealTabs();
@@ -1219,6 +1340,53 @@ document.addEventListener('click', async (e) => {
   if (!actionEl) return;
 
   const action = actionEl.dataset.action;
+
+  // ---- Quick access ----
+  if (action === 'toggle-quick-link-form') {
+    const form = document.getElementById('quickLinkForm');
+    setQuickLinkFormOpen(Boolean(form?.hidden));
+    return;
+  }
+
+  if (action === 'cancel-quick-link-form') {
+    document.getElementById('quickLinkForm')?.reset();
+    setQuickLinkFormOpen(false);
+    return;
+  }
+
+  if (action === 'open-quick-link') {
+    const url = actionEl.dataset.quickLinkUrl;
+    if (url) await chrome.tabs.update({ url });
+    return;
+  }
+
+  if (action === 'remove-quick-link') {
+    const id = actionEl.dataset.quickLinkId;
+    if (!id) return;
+
+    const shortcut = actionEl.closest('.quick-link-shell');
+    if (shortcut) {
+      const rect = shortcut.getBoundingClientRect();
+      playCloseSound();
+      shootConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      shortcut.classList.add('removing');
+      const animation = shortcut.getAnimations()[0];
+      if (animation) {
+        try { await animation.finished; } catch { /* animation was interrupted */ }
+      }
+    }
+
+    await removeCustomQuickLink(id);
+    if (shortcut) {
+      shortcut.remove();
+      const hasLinks = Boolean(document.querySelector('#quickLinks .quick-link-shell'));
+      syncQuickAccessVisibility(hasLinks);
+    } else {
+      await renderQuickLinks();
+    }
+    showToast('Shortcut removed');
+    return;
+  }
 
   // ---- Close duplicate Tab Out tabs ----
   if (action === 'close-tabout-dupes') {
@@ -1507,6 +1675,24 @@ document.addEventListener('input', async (e) => {
   }
 });
 
+document.getElementById('quickLinkForm')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  // currentTarget is cleared by the browser after the first await, so retain
+  // the form reference before saving to storage.
+  const form = e.currentTarget;
+  const urlInput = document.getElementById('quickLinkUrl');
+
+  try {
+    await addCustomQuickLink(urlInput.value);
+    form.reset();
+    await renderQuickLinks();
+    setQuickLinkFormOpen(false);
+    showToast('Shortcut saved');
+  } catch {
+    showToast('Enter a valid web address');
+    urlInput.focus();
+  }
+});
 
 /* ----------------------------------------------------------------
    INITIALIZE
