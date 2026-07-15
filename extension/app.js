@@ -15,6 +15,16 @@
 
 'use strict';
 
+// Chrome extension CSP blocks inline event handlers such as `onerror`.
+// Use one delegated capture listener so dynamically rendered favicons can
+// hide themselves when the remote image cannot be loaded.
+document.addEventListener('error', event => {
+  const image = event.target;
+  if (image instanceof HTMLImageElement && image.hasAttribute('data-hide-on-error')) {
+    image.style.display = 'none';
+  }
+}, true);
+
 
 /* ----------------------------------------------------------------
    CHROME TABS — Direct API Access
@@ -611,6 +621,18 @@ function capitalize(str) {
   return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
+// Values from tab titles, URLs, and chrome.storage must never be inserted into
+// an HTML template verbatim. Besides breaking the layout, markup in a title
+// could create an inline event handler that Chrome's extension CSP blocks.
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function stripTitleNoise(title) {
   if (!title) return '';
   // Strip leading notification count: "(2) Title"
@@ -763,14 +785,15 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
     const count    = urlCounts[tab.url] || 1;
     const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
     const chipClass = count > 1 ? ' chip-has-dupes' : '';
-    const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = label.replace(/"/g, '&quot;');
+    const safeUrl   = escapeHtml(tab.url || '');
+    const safeTitle = escapeHtml(label);
+    const safeLabel = escapeHtml(label);
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
-      <span class="chip-text">${label}</span>${dupeTag}
+      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-hide-on-error>` : ''}
+      <span class="chip-text">${safeLabel}</span>${dupeTag}
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
@@ -800,7 +823,7 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
  * Builds the HTML for one domain group card.
  * group = { domain: string, tabs: [{ url, title, id, windowId, active }] }
  */
-function renderDomainCard(group) {
+function renderDomainCard(group, groupIndex = 0) {
   const tabs      = group.tabs || [];
   const tabCount  = tabs.length;
   const isLanding = group.domain === '__landing-pages__';
@@ -844,14 +867,15 @@ function renderDomainCard(group) {
     const count    = urlCounts[tab.url];
     const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
     const chipClass = count > 1 ? ' chip-has-dupes' : '';
-    const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = label.replace(/"/g, '&quot;');
+    const safeUrl   = escapeHtml(tab.url || '');
+    const safeTitle = escapeHtml(label);
+    const safeLabel = escapeHtml(label);
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
-      <span class="chip-text">${label}</span>${dupeTag}
+      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-hide-on-error>` : ''}
+      <span class="chip-text">${safeLabel}</span>${dupeTag}
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
@@ -870,19 +894,22 @@ function renderDomainCard(group) {
     </button>`;
 
   if (hasDupes) {
-    const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
+    const dupeUrlsEncoded = escapeHtml(dupeUrls.map(([url]) => encodeURIComponent(url)).join(','));
     actionsHtml += `
       <button class="action-btn" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}">
         Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
       </button>`;
   }
 
+  // Keep the reveal lively without making a large tab collection wait too long.
+  const cardDelay = Math.min(220 + groupIndex * 45, 760);
+
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}">
+    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}" style="--card-delay:${cardDelay}ms">
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
-          <span class="mission-name">${isLanding ? 'Homepages' : (group.label || friendlyDomain(group.domain))}</span>
+          <span class="mission-name">${escapeHtml(isLanding ? 'Homepages' : (group.label || friendlyDomain(group.domain)))}</span>
           ${tabBadge}
           ${dupeBadge}
         </div>
@@ -968,20 +995,23 @@ function renderDeferredItem(item) {
   try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch {}
   const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
   const ago = timeAgo(item.savedAt);
+  const safeId = escapeHtml(item.id);
+  const safeUrl = escapeHtml(item.url);
+  const safeTitle = escapeHtml(item.title || item.url);
 
   return `
-    <div class="deferred-item" data-deferred-id="${item.id}">
-      <input type="checkbox" class="deferred-checkbox" data-action="check-deferred" data-deferred-id="${item.id}">
+    <div class="deferred-item" data-deferred-id="${safeId}">
+      <input type="checkbox" class="deferred-checkbox" data-action="check-deferred" data-deferred-id="${safeId}">
       <div class="deferred-info">
-        <a href="${item.url}" target="_blank" rel="noopener" class="deferred-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
-          <img src="${faviconUrl}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px" onerror="this.style.display='none'">${item.title || item.url}
+        <a href="${safeUrl}" target="_blank" rel="noopener" class="deferred-title" title="${safeTitle}">
+          <img src="${escapeHtml(faviconUrl)}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px" data-hide-on-error>${safeTitle}
         </a>
         <div class="deferred-meta">
-          <span>${domain}</span>
-          <span>${ago}</span>
+          <span>${escapeHtml(domain)}</span>
+          <span>${escapeHtml(ago)}</span>
         </div>
       </div>
-      <button class="deferred-dismiss" data-action="dismiss-deferred" data-deferred-id="${item.id}" title="Dismiss">
+      <button class="deferred-dismiss" data-action="dismiss-deferred" data-deferred-id="${safeId}" title="Dismiss">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
       </button>
     </div>`;
@@ -994,12 +1024,14 @@ function renderDeferredItem(item) {
  */
 function renderArchiveItem(item) {
   const ago = item.completedAt ? timeAgo(item.completedAt) : timeAgo(item.savedAt);
+  const safeUrl = escapeHtml(item.url);
+  const safeTitle = escapeHtml(item.title || item.url);
   return `
     <div class="archive-item">
-      <a href="${item.url}" target="_blank" rel="noopener" class="archive-item-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
-        ${item.title || item.url}
+      <a href="${safeUrl}" target="_blank" rel="noopener" class="archive-item-title" title="${safeTitle}">
+        ${safeTitle}
       </a>
-      <span class="archive-item-date">${ago}</span>
+      <span class="archive-item-date">${escapeHtml(ago)}</span>
     </div>`;
 }
 
@@ -1151,7 +1183,7 @@ async function renderStaticDashboard() {
   if (domainGroups.length > 0 && openTabsSection) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Open tabs';
     openTabsSectionCount.innerHTML = `${domainGroups.length} domain${domainGroups.length !== 1 ? 's' : ''} &nbsp;&middot;&nbsp; <button class="action-btn close-tabs" data-action="close-all-open-tabs" style="font-size:11px;padding:3px 10px;">${ICONS.close} Close all ${realTabs.length} tabs</button>`;
-    openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
+    openTabsMissionsEl.innerHTML = domainGroups.map((group, index) => renderDomainCard(group, index)).join('');
     openTabsSection.style.display = 'block';
   } else if (openTabsSection) {
     openTabsSection.style.display = 'none';
